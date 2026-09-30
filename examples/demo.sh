@@ -155,4 +155,57 @@ $C -i -X POST "$BASE/payments" -H 'Content-Type: application/json' \
 say "23) 付款后对账：付款流水已入，余额 0；历史付款不被负额追补撤销（负额留待后续抵扣）"
 $C "$BASE/rightsholders/RS-A/ledger" | python3 -m json.tool
 
+say "24) 银行回单核验准备：再登记一笔 RS-B 付款 9 分（回单将错记为 RS-C => 权利人不符）"
+$C -X POST "$BASE/payments" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-B","external_ref":"BANK-20260302-0002","amount":9}' | python3 -m json.tool
+
+say "25) 批次导入银行回单：匹配 / 权利人不符 / 付款未登记 各一行，导入即冻结第 1 版结论"
+$C -X POST "$BASE/receipts/import" -H 'Content-Type: application/json' -d '{
+  "batch_no":"RC-20260301-01",
+  "receipts":[
+    {"receipt_no":"RC-1","external_ref":"BANK-20260301-0001","holder_code":"RS-A","amount":19},
+    {"receipt_no":"RC-2","external_ref":"BANK-20260302-0002","holder_code":"RS-C","amount":9},
+    {"receipt_no":"RC-3","external_ref":"BANK-20260303-0003","holder_code":"RS-C","amount":2}
+  ]
+}' | python3 -m json.tool
+
+say "26) 同批次同内容重试 => 幂等返回原批次(status=duplicate, HTTP 200)"
+$C -i -X POST "$BASE/receipts/import" -H 'Content-Type: application/json' -d '{
+  "batch_no":"RC-20260301-01",
+  "receipts":[
+    {"receipt_no":"RC-3","external_ref":"BANK-20260303-0003","holder_code":"RS-C","amount":2},
+    {"receipt_no":"RC-1","external_ref":"BANK-20260301-0001","holder_code":"RS-A","amount":19},
+    {"receipt_no":"RC-2","external_ref":"BANK-20260302-0002","holder_code":"RS-C","amount":9}
+  ]
+}' | head -1
+
+say "27) 批次号/回单编号异内容复用 => 409；批内重复流水号、无效字段 => 422（均整批拒绝）"
+$C -i -X POST "$BASE/receipts/import" -H 'Content-Type: application/json' \
+  -d '{"batch_no":"RC-20260301-01","receipts":[{"receipt_no":"RC-9","external_ref":"BANK-X","holder_code":"RS-A","amount":1}]}' | head -1
+$C -i -X POST "$BASE/receipts/import" -H 'Content-Type: application/json' \
+  -d '{"batch_no":"RC-20260301-09","receipts":[{"receipt_no":"RC-1","external_ref":"BANK-X","holder_code":"RS-A","amount":1}]}' | head -1
+$C -i -X POST "$BASE/receipts/import" -H 'Content-Type: application/json' \
+  -d '{"batch_no":"RC-20260301-10","receipts":[{"receipt_no":"RA","external_ref":"BANK-Y","holder_code":"RS-A","amount":1},{"receipt_no":"RB","external_ref":"BANK-Y","holder_code":"RS-A","amount":2}]}' | head -1
+$C -i -X POST "$BASE/receipts/import" -H 'Content-Type: application/json' \
+  -d '{"batch_no":"RC-20260301-11","receipts":[{"receipt_no":"RA","external_ref":"BANK-Z","holder_code":"RS-A","amount":0}]}' | head -1
+
+say "28) 付款迟到：补登 RS-C 2 分后复核 => 结论变化生成第 2 版；再复核结论不变不新增版本"
+$C -X POST "$BASE/payments" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-C","external_ref":"BANK-20260303-0003","amount":2}' | python3 -m json.tool
+$C -X POST "$BASE/receipts/RC-20260301-01/reverify" | python3 -m json.tool
+$C -X POST "$BASE/receipts/RC-20260301-01/reverify" | python3 -m json.tool
+
+say "29) 旧版本与原始回单始终可查：版本列表、第 1 版冻结结论、原始回单行"
+$C "$BASE/receipts/RC-20260301-01/versions" | python3 -m json.tool
+$C "$BASE/receipts/RC-20260301-01/versions/1" | python3 -m json.tool
+$C "$BASE/receipts/RC-20260301-01" | python3 -m json.tool
+
+say "30) 跨批次同一流水号：后续批次同号回单标为重复回单，不参与核验"
+$C -X POST "$BASE/receipts/import" -H 'Content-Type: application/json' -d '{
+  "batch_no":"RC-20260301-02",
+  "receipts":[
+    {"receipt_no":"RC-4","external_ref":"BANK-20260301-0001","holder_code":"RS-A","amount":19}
+  ]
+}' | python3 -m json.tool
+
 say "完成"

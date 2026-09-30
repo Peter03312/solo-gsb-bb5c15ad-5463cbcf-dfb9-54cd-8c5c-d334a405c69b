@@ -226,6 +226,93 @@ WHERE evidence_status = 'traceable'
       WHERE l.batch_id = b.id AND l.amount <> 0
   )
   AND NOT EXISTS (SELECT 1 FROM statement_attributions a WHERE a.batch_id = b.id);
+
+-- 银行回单批次：batch_no 全局唯一；content_hash 为回单行的规范化内容哈希。
+-- 同批次同内容重试幂等返回原批次；批次号异内容复用整批拒绝（409）。
+CREATE TABLE IF NOT EXISTS receipt_batches (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    batch_no     text NOT NULL UNIQUE,
+    content_hash text NOT NULL,
+    line_count   integer NOT NULL CHECK (line_count > 0),
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- 银行回单：receipt_no 全局内容绑定（异内容复用整批拒绝；
+-- 同内容复用不拒绝，但因流水号已被首次导入占用而标为重复回单）。
+-- 跨批次同一外部付款流水号：仅首次成功导入的回单参与核验（is_duplicate=false），
+-- 其余在导入时标记为重复回单（is_duplicate=true），不参与核验。
+CREATE TABLE IF NOT EXISTS receipts (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    batch_id     bigint NOT NULL REFERENCES receipt_batches(id),
+    receipt_no   text NOT NULL,
+    external_ref text NOT NULL,
+    holder_code  text NOT NULL,
+    amount       bigint NOT NULL CHECK (amount > 0),
+    is_duplicate boolean NOT NULL DEFAULT false,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (batch_id, receipt_no)
+);
+-- 回单编号全局内容检查、流水号跨批次去重的主查询索引
+CREATE INDEX IF NOT EXISTS receipts_no_idx ON receipts(receipt_no);
+CREATE INDEX IF NOT EXISTS receipts_ref_idx ON receipts(external_ref);
+
+-- 回单核验版本：导入时冻结第 1 版逐行结论；付款迟到后可复核，
+-- 结论变化才生成新版本（version 递增），结论不变不新增版本；
+-- 旧版本与原始回单始终可查。
+CREATE TABLE IF NOT EXISTS receipt_verifications (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    batch_id   bigint NOT NULL REFERENCES receipt_batches(id),
+    version    integer NOT NULL CHECK (version > 0),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (batch_id, version)
+);
+
+-- 逐行核验结论（冻结，此后不随付款数据变化）：
+--   matched                 匹配（流水号命中已登记付款，权利人与金额均一致）
+--   payment_not_registered  付款未登记（流水号无已登记付款）
+--   mismatched              权利人不符和/或金额不符（两项均不符同时列出）
+--   duplicate               重复回单（跨批次同流水号，不参与核验）
+CREATE TABLE IF NOT EXISTS receipt_verification_lines (
+    id                  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    verification_id     bigint NOT NULL REFERENCES receipt_verifications(id) ON DELETE CASCADE,
+    receipt_id          bigint NOT NULL REFERENCES receipts(id),
+    status              text NOT NULL CHECK (status IN
+                            ('matched', 'payment_not_registered', 'mismatched', 'duplicate')),
+    holder_mismatch     boolean NOT NULL DEFAULT false,
+    amount_mismatch     boolean NOT NULL DEFAULT false,
+    payment_holder_code text,
+    payment_amount      bigint,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (verification_id, receipt_id)
+);
+
+-- 历史不可变：回单批次、原始回单、核验版本与逐行结论一经写入
+-- 即禁止修改/删除（核验只新增版本，绝不改写付款、余额或单据）。
+CREATE OR REPLACE FUNCTION receipts_frozen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'receipt batches, receipts and verification results are frozen '
+                  || 'and must not be ' || TG_OP || 'd';
+END;
+$$;
+DROP TRIGGER IF EXISTS receipt_batches_frozen_trg ON receipt_batches;
+CREATE TRIGGER receipt_batches_frozen_trg
+    BEFORE UPDATE OR DELETE ON receipt_batches
+    FOR EACH ROW EXECUTE FUNCTION receipts_frozen();
+DROP TRIGGER IF EXISTS receipts_frozen_trg ON receipts;
+CREATE TRIGGER receipts_frozen_trg
+    BEFORE UPDATE OR DELETE ON receipts
+    FOR EACH ROW EXECUTE FUNCTION receipts_frozen();
+DROP TRIGGER IF EXISTS receipt_verifications_frozen_trg ON receipt_verifications;
+CREATE TRIGGER receipt_verifications_frozen_trg
+    BEFORE UPDATE OR DELETE ON receipt_verifications
+    FOR EACH ROW EXECUTE FUNCTION receipts_frozen();
+DROP TRIGGER IF EXISTS receipt_verification_lines_frozen_trg ON receipt_verification_lines;
+CREATE TRIGGER receipt_verification_lines_frozen_trg
+    BEFORE UPDATE OR DELETE ON receipt_verification_lines
+    FOR EACH ROW EXECUTE FUNCTION receipts_frozen();
 """
 
 

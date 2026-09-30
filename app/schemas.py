@@ -303,3 +303,100 @@ class HolderLedger(BaseModel):
     balance: int
     statements: list[LedgerStatementItem]
     payments: list[LedgerPaymentItem]
+
+
+# ---- 银行回单批次导入与付款核验 ----
+
+class ReceiptLineIn(BaseModel):
+    # 回单编号（全局内容绑定：异内容复用整批拒绝）
+    receipt_no: str = Field(min_length=1, max_length=200)
+    # 外部付款流水号（对照已登记付款的依据）
+    external_ref: str = Field(min_length=1, max_length=200)
+    # 权利人编号（回单所载，不要求已建档；与付款不一致即权利人不符）
+    holder_code: str = Field(min_length=1, max_length=200)
+    # 正整数分额（最小货币单位）
+    amount: int = Field(strict=True, ge=1)
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def reject_bool_amount(cls, v):
+        # JSON 的 true/false 虽是 int 子类，但不是合法金额
+        if isinstance(v, bool):
+            raise ValueError("amount must be an integer, not boolean")
+        return v
+
+
+class ReceiptBatchIn(BaseModel):
+    # 批次编号（同内容重试幂等；异内容复用整批拒绝）
+    batch_no: str = Field(min_length=1, max_length=200)
+    receipts: list[ReceiptLineIn] = Field(min_length=1, max_length=1000)
+
+
+class ReceiptLineOut(BaseModel):
+    receipt_no: str
+    external_ref: str
+    holder_code: str
+    amount: int
+    # 是否重复回单（跨批次同一流水号，仅首次成功导入的参与核验）
+    is_duplicate: bool
+
+
+class ReceiptDifferenceOut(BaseModel):
+    receipt_no: str
+    external_ref: str
+    # payment_not_registered | mismatched | duplicate
+    status: str
+    # 不符项：holder_mismatch / amount_mismatch；两项均不符同时列出
+    differences: list[str]
+    receipt_holder_code: str
+    receipt_amount: int
+    # 核验时冻结的已登记付款快照；付款未登记/重复回单为 None
+    payment_holder_code: str | None
+    payment_amount: int | None
+
+
+class ReceiptVerificationOut(BaseModel):
+    batch_no: str
+    version: int
+    created_at: datetime
+    # 状态计数：matched / payment_not_registered / mismatched / duplicate / total
+    counts: dict[str, int]
+    # 差异行：全部非 matched 行（含重复回单），按回单编号升序
+    differences: list[ReceiptDifferenceOut]
+
+
+class ReceiptBatchOut(BaseModel):
+    batch_no: str
+    # created=新导入；duplicate=同批次同内容重试，返回原批次
+    status: str
+    created_at: datetime
+    receipts: list[ReceiptLineOut]
+    # 导入时冻结的第 1 版逐行核验结论
+    verification: ReceiptVerificationOut
+
+
+class ReceiptBatchDetail(BaseModel):
+    batch_no: str
+    created_at: datetime
+    line_count: int
+    latest_version: int
+    # 原始回单行（始终可查，不随核验版本变化）
+    receipts: list[ReceiptLineOut]
+
+
+class ReceiptReverifyOut(BaseModel):
+    batch_no: str
+    # created=结论变化已生成新版本；unchanged=结论不变，未新增版本
+    status: str
+    verification: ReceiptVerificationOut
+
+
+class ReceiptVersionSummary(BaseModel):
+    version: int
+    created_at: datetime
+    counts: dict[str, int]
+
+
+class ReceiptVersionList(BaseModel):
+    batch_no: str
+    versions: list[ReceiptVersionSummary]

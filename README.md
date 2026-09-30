@@ -40,6 +40,18 @@ Python + FastAPI + PostgreSQL 实现的播放版税结算服务，支持：
   - 按权利人查询单据增减、付款流水与余额（`/rightsholders/{code}/ledger`）；
   - 付款与出单/其他付款并发时，以「流水号事务咨询锁 + 权利人行锁（出单侧按编号升序加锁）」
     保证**校验与入账一致、绝不超付、无死锁**。
+- **银行回单批次导入与付款核验（财务对账）**：
+  - 按批次导入回单：批次编号 + 回单行（回单编号、外部付款流水号、权利人编号、正整数分额）；
+    批次同内容重试 **幂等返回原批次**（`status=duplicate`，HTTP 200）；
+    批次号或回单编号 **异内容复用**、批内重复流水号、无效字段均 **整批拒绝**，
+    不留任何回单；
+  - 跨批次同一付款流水号 **仅首次成功导入的回单参与核验**，其余标为 **重复回单**；
+  - 有效回单按流水号对照已登记付款，区分 **匹配 / 付款未登记 / 权利人不符 / 金额不符**，
+    两项均不符 **同时列出**；导入时 **冻结逐行结论**（第 1 版）；
+  - 付款迟到后可 **复核**：结论变化才生成 **新版本**，结论不变不新增版本；
+    **旧版本与原始回单始终可查**；
+  - 每版输出 **状态计数及差异行**；付款与复核并发时，一版内全部结论来自
+    **同一已提交状态**（单语句快照）；核验 **不改写付款、余额或单据**。
 
 ## 一键启动
 
@@ -142,6 +154,16 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/payments` | 登记已完成付款；新登记 201，同流水号同内容重试 200 返回原记录 |
 | GET | `/rightsholders/{holder_code}/ledger` | 按权利人查询单据增减、付款流水及当前余额（不存在 404） |
 
+### 银行回单核验
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/receipts/import` | 按批次导入回单并冻结第 1 版核验结论；同内容重试 200 返回原批次；异内容复用 409；批内重复/无效字段 422 整批拒绝 |
+| POST | `/receipts/{batch_no}/reverify` | 按当前已登记付款复核；结论变化生成新版本（201），不变不新增（200 返回最新版） |
+| GET | `/receipts/{batch_no}` | 批次原始回单行（含重复回单标记）与最新版本号 |
+| GET | `/receipts/{batch_no}/versions` | 全部核验版本及各版状态计数（旧版本始终可查） |
+| GET | `/receipts/{batch_no}/versions/{version}` | 指定版本的状态计数及差异行（结论已冻结） |
+
 `POST /payments` 请求体：
 
 ```json
@@ -179,6 +201,78 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 试算与待处理播放不在内；负余额表示"历史付款暂未被后续正额抵扣完"，仍可核对。
 
 期间同样是半开区间 `[start, end)`，与协议区间语义一致。
+
+#### 银行回单批次导入与核验
+
+`POST /receipts/import` 请求体：
+
+```json
+{
+  "batch_no": "RC-20260301-01",
+  "receipts": [
+    {"receipt_no": "RC-1", "external_ref": "BANK-20260301-0001", "holder_code": "RS-A", "amount": 19},
+    {"receipt_no": "RC-2", "external_ref": "BANK-20260302-0002", "holder_code": "RS-B", "amount": 9}
+  ]
+}
+```
+
+- 回单行字段：`receipt_no`（回单编号）、`external_ref`（外部付款流水号）、
+  `holder_code`（权利人编号，回单所载，不要求已建档）、`amount`（正整数分额）；
+  空编号、非正整数金额等无效字段 **422 整批拒绝**，不留任何回单。
+- 导入响应（201，`status=created`）含原始回单行（`is_duplicate` 标记）与
+  导入时冻结的第 1 版核验结论 `verification`：
+
+```json
+{
+  "batch_no": "RC-20260301-01",
+  "status": "created",
+  "created_at": "2026-03-02T02:00:00Z",
+  "receipts": [
+    {"receipt_no": "RC-1", "external_ref": "BANK-20260301-0001",
+     "holder_code": "RS-A", "amount": 19, "is_duplicate": false}
+  ],
+  "verification": {
+    "batch_no": "RC-20260301-01",
+    "version": 1,
+    "created_at": "2026-03-02T02:00:00Z",
+    "counts": {"matched": 1, "payment_not_registered": 0,
+               "mismatched": 1, "duplicate": 0, "total": 2},
+    "differences": [
+      {"receipt_no": "RC-2", "external_ref": "BANK-20260302-0002",
+       "status": "mismatched", "differences": ["holder_mismatch"],
+       "receipt_holder_code": "RS-B", "receipt_amount": 9,
+       "payment_holder_code": "RS-C", "payment_amount": 9}
+    ]
+  }
+}
+```
+
+- 逐行结论 `status`：`matched`（流水号命中已登记付款且权利人、金额均一致）、
+  `payment_not_registered`（付款未登记）、`mismatched`（`differences` 列出
+  `holder_mismatch` / `amount_mismatch`，**两项均不符同时列出**）、
+  `duplicate`（跨批次同一流水号的重复回单，不参与核验）；
+  差异行附回单与付款双方快照（`receipt_*` / `payment_*`）。
+- 幂等与拒绝：批次同内容重试 **200 返回原批次**（`status=duplicate`，含第 1 版结论）；
+  批次号异内容复用 **409 `receipt_batch_conflict`**；
+  回单编号异内容复用 **409 `receipt_no_conflict`**（`detail` 回显已导入内容）；
+  批内重复流水号 / 重复回单编号 **422**；上述拒绝均 **整批不留痕**。
+- 跨批次同一流水号：仅 **首次成功导入** 的回单参与核验；后续批次中同号回单
+  标为 `is_duplicate=true`、结论 `duplicate`（同内容复用回单编号亦按此处理）。
+
+`POST /receipts/{batch_no}/reverify`（付款迟到后复核）：
+
+- 按 **当前已登记付款** 重算逐行结论：与最新版不同才冻结为新版本
+  （201，`status=created`）；结论不变不新增版本
+  （200，`status=unchanged`，返回现有最新版）；
+- 付款与复核并发时，一版内全部结论来自 **同一已提交状态**（单语句快照）；
+- 复核只新增核验版本，**绝不改写付款、余额或单据**；批次不存在 404。
+
+查询（旧版本与原始回单始终可查）：
+
+- `GET /receipts/{batch_no}`：原始回单行（含 `is_duplicate`）与 `latest_version`；
+- `GET /receipts/{batch_no}/versions`：全部版本及各版状态计数；
+- `GET /receipts/{batch_no}/versions/{version}`：指定版本的状态计数及差异行；
+  版本不存在 404 `receipt_version_not_found`。
 
 #### 逐笔归因查询参数
 
@@ -298,6 +392,56 @@ curl -sS -i -X POST http://localhost:8000/payments -H 'Content-Type: application
 curl -sS "http://localhost:8000/rightsholders/RS-A/ledger" | python3 -m json.tool
 ```
 
+财务按批次导入银行回单，核验已登记付款（承上：BANK-20260301-0001 已付 RS-A 19 分）：
+
+```bash
+# 1) 再登记两笔付款：RS-B 9 分（回单将错记权利人）、RS-C 2 分（回单迟到后补登）
+curl -sS -X POST http://localhost:8000/payments -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-B","external_ref":"BANK-20260302-0002","amount":9}'
+
+# 2) 导入批次 RC-20260301-01：匹配 / 权利人不符 / 付款未登记 各一行
+curl -sS -X POST http://localhost:8000/receipts/import -H 'Content-Type: application/json' \
+  -d '{
+    "batch_no":"RC-20260301-01",
+    "receipts":[
+      {"receipt_no":"RC-1","external_ref":"BANK-20260301-0001","holder_code":"RS-A","amount":19},
+      {"receipt_no":"RC-2","external_ref":"BANK-20260302-0002","holder_code":"RS-C","amount":9},
+      {"receipt_no":"RC-3","external_ref":"BANK-20260303-0003","holder_code":"RS-C","amount":2}
+    ]
+  }' | python3 -m json.tool
+# => 201，verification(version=1)：counts matched=1 / mismatched=1(RC-2 holder_mismatch)
+#    / payment_not_registered=1(RC-3)
+
+# 3) 同内容重试 => 200 status=duplicate 返回原批次；异内容复用批次号 => 409
+curl -sS -i -X POST http://localhost:8000/receipts/import -H 'Content-Type: application/json' \
+  -d '{"batch_no":"RC-20260301-01","receipts":[
+      {"receipt_no":"RC-1","external_ref":"BANK-20260301-0001","holder_code":"RS-A","amount":19},
+      {"receipt_no":"RC-2","external_ref":"BANK-20260302-0002","holder_code":"RS-C","amount":9},
+      {"receipt_no":"RC-3","external_ref":"BANK-20260303-0003","holder_code":"RS-C","amount":2}]}' | head -1
+curl -sS -i -X POST http://localhost:8000/receipts/import -H 'Content-Type: application/json' \
+  -d '{"batch_no":"RC-20260301-01","receipts":[
+      {"receipt_no":"RC-9","external_ref":"BANK-X","holder_code":"RS-A","amount":1}]}' | head -1
+
+# 4) 付款迟到：补登 RS-C 2 分后复核 => 生成第 2 版（RC-3 转为 matched）
+curl -sS -X POST http://localhost:8000/payments -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-C","external_ref":"BANK-20260303-0003","amount":2}'
+curl -sS -X POST http://localhost:8000/receipts/RC-20260301-01/reverify | python3 -m json.tool
+# 结论不变再复核 => 200 status=unchanged，不新增版本
+curl -sS -X POST http://localhost:8000/receipts/RC-20260301-01/reverify | python3 -m json.tool
+
+# 5) 旧版本与原始回单始终可查
+curl -sS "http://localhost:8000/receipts/RC-20260301-01/versions" | python3 -m json.tool
+curl -sS "http://localhost:8000/receipts/RC-20260301-01/versions/1" | python3 -m json.tool
+curl -sS "http://localhost:8000/receipts/RC-20260301-01" | python3 -m json.tool
+
+# 6) 跨批次同一流水号：后续批次同号回单标为重复回单，不参与核验
+curl -sS -X POST http://localhost:8000/receipts/import -H 'Content-Type: application/json' \
+  -d '{"batch_no":"RC-20260301-02","receipts":[
+      {"receipt_no":"RC-4","external_ref":"BANK-20260301-0001","holder_code":"RS-A","amount":19}
+    ]}' | python3 -m json.tool
+# => RC-4 is_duplicate=true，结论 status=duplicate
+```
+
 ## 分摊示例
 
 金额 100，比例 62.5% / 30% / 7.5%：
@@ -321,13 +465,16 @@ python3 -m unittest discover -s tests -v
 **无需 Docker / root**，覆盖登记、幂等、重叠、更正链、待处理、初次/追补单、并发出具等全链路；
 逐笔归因证据（冻结/撤销负额/分页对账/不可变/存量不可追溯与 legacy 旧账/错误码）另有一套；
 付款核对（余额口径/幂等与冲突/超额拒绝不留痕/负额追补不撤销与后续抵扣/
-试算待处理不入账/付款与出单及其他付款并发不超付）再有一套：
+试算待处理不入账/付款与出单及其他付款并发不超付）再有一套；
+银行回单核验（整批拒绝/幂等重试/异内容复用/跨批次重复回单/冻结结论/迟到付款复核版本化/
+并发复核与并发导入/付款与复核并发快照一致/核验不改写账务）又有一套：
 
 ```bash
 pip install pgserver httpx
 PYTHONPATH=. python3 tests/integration_pgserver.py       # 原有全链路
 PYTHONPATH=. python3 tests/integration_attribution.py    # 逐笔归因证据
 PYTHONPATH=. python3 tests/integration_payments.py       # 付款登记与权利人对账
+PYTHONPATH=. python3 tests/integration_receipts.py       # 银行回单批次导入与付款核验
 ```
 
 ## 目录结构
@@ -341,12 +488,14 @@ app/
   schemas.py              # Pydantic 模型与输入校验
   statements_service.py   # 期间匹配、重算、初次/追补出具、并发互斥、逐笔归因冻结与分页对账
   payments_service.py     # 付款登记（流水号锁/余额校验/幂等冲突）、权利人对账单、出单侧权利人行锁
+  receipts_service.py     # 回单批次导入（幂等/整批拒绝/跨批次去重）、核验结论冻结与复核版本化
   routers/
     catalog.py            # 作品 / 权利人 / 协议（含协议区间互斥）
     plays.py              # 播放导入、幂等、更正链
     statements.py         # 单据出具、试算、查询、逐笔归因分页查询
     payments.py           # 付款登记、按权利人对账
+    receipts.py           # 回单批次导入、复核、版本查询
 examples/demo.sh          # 端到端 curl 示例
-tests/                    # 单元测试与三套 pgserver 端到端集成测试
+tests/                    # 单元测试与四套 pgserver 端到端集成测试
 Dockerfile  docker-compose.yml  requirements.txt
 ```
