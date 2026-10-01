@@ -40,6 +40,24 @@ Python + FastAPI + PostgreSQL 实现的播放版税结算服务，支持：
   - 按权利人查询单据增减、付款流水与余额（`/rightsholders/{code}/ledger`）；
   - 付款与出单/其他付款并发时，以「流水号事务咨询锁 + 权利人行锁（出单侧按编号升序加锁）」
     保证**校验与入账一致、绝不超付、无死锁**。
+- **银行回单按批次导入与核验（财务对账）**：
+  - 输入**批次编号**与回单行（回单编号、外部付款流水号、权利人编号、**正整数分额**）；
+    同批次编号同内容重试**幂等返回原批次**（`status=duplicate_batch`，HTTP 200，不新增版本/回单）；
+    批次号异内容复用（409 `receipt_batch_conflict`）、回单编号跨批次复用（409 `receipt_no_conflict`）、
+    批内重复流水号/回单编号（422）、无效字段（422）一律**整批拒绝、不留任何数据**；
+  - 跨批次同一外部付款流水号：**仅首次成功导入的回单参与核验**（有效回单），
+    其余回单一律标为**重复回单**（`duplicate=true`、状态 `duplicate_receipt`，记录归属批次，不参与核验）；
+  - 有效回单按流水号对照**当时已提交**的已登记付款，逐行结论：
+    `matched`（匹配）、`payment_unregistered`（付款未登记）、
+    `holder_mismatch`（权利人不符）、`amount_mismatch`（金额不符）、
+    `both_mismatch`（两项均不符，`mismatches` **同时列出 holder 与 amount**）；
+  - 导入时逐行结论**冻结为第 1 版**；付款迟到后可**复核**，
+    结论有变化才生成新版本（`created_by=review`，HTTP 201），**结论不变不新增版本**（HTTP 200 `unchanged`）；
+    **旧版与原始回单始终可查**（回单/批次/版本均有不可变触发器保护）；
+  - 每版输出**状态计数**（各状态数、有效/重复数、差异行总数）、**差异行**及与上一版相比的**变化行**；
+  - 付款与复核并发：复核事务使用 **REPEATABLE READ** 单一快照 + 批次咨询锁串行化同批并发，
+    整版结论**来自同一已提交状态**，绝不出现半新半旧；
+  - 核验**只读付款，绝不改写付款、余额或单据**。
 
 ## 一键启动
 
@@ -142,6 +160,68 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/payments` | 登记已完成付款；新登记 201，同流水号同内容重试 200 返回原记录 |
 | GET | `/rightsholders/{holder_code}/ledger` | 按权利人查询单据增减、付款流水及当前余额（不存在 404） |
 
+### 银行回单批量导入与核验
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/bank-receipts/import` | 按批次导入回单并冻结第 1 版核验；201=新导入，200=同内容重试 |
+| POST | `/bank-receipts/{batch_no}/review` | 按当前已提交付款复核；有变化 201 出新版，无变化 200 不新增 |
+| GET | `/bank-receipts` | 批次列表（分页 `page`/`page_size`） |
+| GET | `/bank-receipts/{batch_no}` | 批次详情：原始回单 + 最新版（不存在 404） |
+| GET | `/bank-receipts/{batch_no}/versions/{version_no}` | 查询指定历史版本（旧版始终可查） |
+
+`POST /bank-receipts/import` 请求体：
+
+```json
+{
+  "batch_no": "BR-20260301-01",
+  "lines": [
+    {"receipt_no": "R-001", "external_ref": "TX-A1",   "holder_code": "RS-A", "amount": 60},
+    {"receipt_no": "R-002", "external_ref": "TX-LATE", "holder_code": "RS-A", "amount": 5},
+    {"receipt_no": "R-003", "external_ref": "TX-HLD",  "holder_code": "RS-A", "amount": 10},
+    {"receipt_no": "R-004", "external_ref": "TX-AMT",  "holder_code": "RS-B", "amount": 31},
+    {"receipt_no": "R-005", "external_ref": "TX-BOTH", "holder_code": "RS-A", "amount": 8}
+  ]
+}
+```
+
+- `amount` 为正整数分额；`receipt_no`（回单编号）全局唯一，`external_ref`（外部付款流水号）
+  与 `/payments` 的流水号同名空间对照。批内回单编号、流水号均不得重复。
+- 成功响应（HTTP 201 `status=imported`）要点：
+  - `batch`：批次摘要（`line_count`、`version_count`、`version_numbers`、`latest_version_no`、`imported_at`）；
+  - `raw_receipts[]`：**原始回单**，字段含 `duplicate`、`duplicate_of_batch_no`（重复回单归属的首次批次）；
+  - `latest_version`：导入即冻结的第 1 版（`version_no=1`、`created_by=import`）：
+    - `counts`：`total`、`matched`、`payment_unregistered`、`holder_mismatch`、`amount_mismatch`、
+      `both_mismatch`、`duplicate_receipt`、`effective`（参与核验）、`duplicate_receipts`、`differences`；
+    - `difference_lines[]`：付款未登记 / 三种不符行；`duplicate_lines[]`：重复回单行；
+    - `lines[]`：逐行结论；每行 `status`、`mismatches`（如两项均不符为 `["holder","amount"]`）、
+      `payment`（冻结时对照到的已登记付款 `payment_id/holder_code/amount`，未登记为 `null`）。
+- 幂等与拒绝：
+  - 同 `batch_no` **同内容**重试 → HTTP 200 `status=duplicate_batch`，返回原批次与原版本；
+  - 同 `batch_no` **异内容** → 409 `receipt_batch_conflict`；
+  - `receipt_no` 已在**其他批次**存在 → 409 `receipt_no_conflict`（`detail.existing_batch_no`）；
+  - 批内流水号重复 → 422 `duplicate_external_ref_in_batch`；批内回单编号重复 → 422
+    `duplicate_receipt_no_in_batch`；空行、金额 0/负/非整数/布尔、缺字段、空批次号 → 422；
+  - 以上拒绝均在**单事务**内，不留下任何批次、回单或版本。
+- 跨批次同流水号：仅**首次成功导入**（提交）批次的回单 `duplicate=false` 参与核验；
+  之后批次的同流水号回单 `duplicate=true`、状态 `duplicate_receipt`，
+  并在 `duplicate_of_batch_no` 指向首次批次；重复回单不计入差异。
+
+`POST /bank-receipts/{batch_no}/review`（无请求体）：
+
+- 按**当前已提交付款**重算整批（事务内 REPEATABLE READ，与付款登记并发时整版来自同一快照）：
+  - 结论无变化 → HTTP 200 `status=unchanged`、`new_version=false`、`changed_lines=[]`，**不新增版本**；
+  - 有行结论变化 → HTTP 201 `status=new_version`、`new_version=true`，
+    `latest_version` 为新版本，顶层与版本内 `changed_lines[]` 列出每行 `from_status` → `status`；
+  - 批次不存在 → 404 `receipt_batch_not_found`。连续复核结论不变不会堆积版本。
+
+历史版本与原始回单查询：
+
+- `GET /bank-receipts/{batch_no}`：原始回单（含重复标记，始终不变）+ 最新版；
+- `GET /bank-receipts/{batch_no}/versions/{version_no}`：指定版本（`created_by=import|review`），
+  复核版附 `changed_lines[]`（第 1 版为空）；版本不存在 → 404 `receipt_version_not_found`；
+- 回单、批次、版本及逐行结论均由数据库触发器保护，**一经写入不可修改/删除**，核验不改写付款、余额或单据。
+
 `POST /payments` 请求体：
 
 ```json
@@ -206,6 +286,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 bash examples/demo.sh
+```
+
+银行回单批量导入与核验另有一个一键演示脚本（自动准备作品/付款，覆盖五种逐行结论、
+整批拒绝、跨批次重复回单、迟到付款复核出新版/无变化不出版、旧版与原始回单查询）：
+
+```bash
+bash examples/demo_receipts.sh
 ```
 
 手工调用（以下为关键几步）：
@@ -298,6 +385,48 @@ curl -sS -i -X POST http://localhost:8000/payments -H 'Content-Type: application
 curl -sS "http://localhost:8000/rightsholders/RS-A/ledger" | python3 -m json.tool
 ```
 
+财务按批次导入银行回单并核验（五种逐行结论），付款迟到后复核：
+
+```bash
+# 1. 导入批次：匹配 / 付款未登记 / 权利人不符 / 金额不符 / 两项均不符
+curl -sS -X POST http://localhost:8000/bank-receipts/import \
+  -H 'Content-Type: application/json' -d '{
+    "batch_no":"BR-20260301-01",
+    "lines":[
+      {"receipt_no":"R-001","external_ref":"BANK-20260301-0001","holder_code":"RS-A","amount":19},
+      {"receipt_no":"R-002","external_ref":"TX-LATE","holder_code":"RS-A","amount":5},
+      {"receipt_no":"R-003","external_ref":"TX-HLD","holder_code":"RS-A","amount":10},
+      {"receipt_no":"R-004","external_ref":"TX-AMT","holder_code":"RS-B","amount":31},
+      {"receipt_no":"R-005","external_ref":"TX-BOTH","holder_code":"RS-A","amount":8}
+    ]}' | python3 -m json.tool
+
+# 2. 同批次同内容重试 => 200 duplicate_batch（返回原批次，不新增版本/回单）
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/bank-receipts/import \
+  -H 'Content-Type: application/json' -d '{"batch_no":"BR-20260301-01","lines":[
+    {"receipt_no":"R-001","external_ref":"BANK-20260301-0001","holder_code":"RS-A","amount":19}]}'
+#   注意：上面内容与原批次不同 => 实为 409 receipt_batch_conflict；
+#   幂等重试必须提交与首次完全相同的整批内容。
+
+# 3. 整批拒绝示例：批内重复流水号 422；无效金额 422；跨批次复用回单编号 409
+curl -sS -i -X POST http://localhost:8000/bank-receipts/import \
+  -H 'Content-Type: application/json' -d '{"batch_no":"BR-BAD","lines":[
+    {"receipt_no":"X1","external_ref":"SAME","holder_code":"RS-A","amount":1},
+    {"receipt_no":"X2","external_ref":"SAME","holder_code":"RS-A","amount":2}]}'
+
+# 4. 付款迟到后补登，再复核 => 201 new_version，changed_lines 仅含状态变化行
+curl -sS -X POST http://localhost:8000/payments -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-A","external_ref":"TX-LATE","amount":5}'
+curl -sS -X POST http://localhost:8000/bank-receipts/BR-20260301-01/review | python3 -m json.tool
+
+# 5. 再复核（结论不变）=> 200 unchanged，不新增版本
+curl -sS -X POST http://localhost:8000/bank-receipts/BR-20260301-01/review \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["status"],d["new_version"])'
+
+# 6. 旧版（R-002 当时为 payment_unregistered）与原始回单始终可查
+curl -sS http://localhost:8000/bank-receipts/BR-20260301-01/versions/1 | python3 -m json.tool
+curl -sS http://localhost:8000/bank-receipts/BR-20260301-01 | python3 -m json.tool
+```
+
 ## 分摊示例
 
 金额 100，比例 62.5% / 30% / 7.5%：
@@ -321,13 +450,17 @@ python3 -m unittest discover -s tests -v
 **无需 Docker / root**，覆盖登记、幂等、重叠、更正链、待处理、初次/追补单、并发出具等全链路；
 逐笔归因证据（冻结/撤销负额/分页对账/不可变/存量不可追溯与 legacy 旧账/错误码）另有一套；
 付款核对（余额口径/幂等与冲突/超额拒绝不留痕/负额追补不撤销与后续抵扣/
-试算待处理不入账/付款与出单及其他付款并发不超付）再有一套：
+试算待处理不入账/付款与出单及其他付款并发不超付）再有一套；
+银行回单（整批拒绝不留痕/同内容幂等/跨批次流水号首次有效其余标重复/五种逐行结论与
+两项均不符并列/导入冻结/迟到付款复核出新版且无变化不出版/旧版与原始回单可查/
+不可变触发器/同批并发幂等与跨批并发首次唯一/付款与复核并发快照一致）又有一套：
 
 ```bash
-pip install pgserver httpx
+pip install pgserver httpx uvicorn
 PYTHONPATH=. python3 tests/integration_pgserver.py       # 原有全链路
 PYTHONPATH=. python3 tests/integration_attribution.py    # 逐笔归因证据
 PYTHONPATH=. python3 tests/integration_payments.py       # 付款登记与权利人对账
+PYTHONPATH=. python3 tests/integration_receipts.py       # 银行回单批量导入与核验
 ```
 
 ## 目录结构
@@ -341,12 +474,15 @@ app/
   schemas.py              # Pydantic 模型与输入校验
   statements_service.py   # 期间匹配、重算、初次/追补出具、并发互斥、逐笔归因冻结与分页对账
   payments_service.py     # 付款登记（流水号锁/余额校验/幂等冲突）、权利人对账单、出单侧权利人行锁
+  receipts_service.py     # 银行回单整批导入/整批拒绝、跨批次重复标记、逐行对照冻结、复核版本与查询
   routers/
     catalog.py            # 作品 / 权利人 / 协议（含协议区间互斥）
     plays.py              # 播放导入、幂等、更正链
     statements.py         # 单据出具、试算、查询、逐笔归因分页查询
     payments.py           # 付款登记、按权利人对账
+    receipts.py           # 银行回单导入、复核、批次与历史版本查询
 examples/demo.sh          # 端到端 curl 示例
-tests/                    # 单元测试与三套 pgserver 端到端集成测试
+examples/demo_receipts.sh # 银行回单批量导入与核验 curl 示例
+tests/                    # 单元测试与四套 pgserver 端到端集成测试
 Dockerfile  docker-compose.yml  requirements.txt
 ```

@@ -1,14 +1,4 @@
 from fastapi import APIRouter, Depends
-
-from .. import payments_service as svc
-from ..db import get_conn
-from ..errors import APIError
-from ..schemas import HolderLedger, PaymentIn, PaymentOut
-
-router = APIRouter(tags=["payments"])
-
-
-from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
 from .. import payments_service as svc

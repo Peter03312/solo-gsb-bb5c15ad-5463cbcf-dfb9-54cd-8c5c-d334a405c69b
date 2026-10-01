@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 
 from .db import close_pool, init_pool
 from .errors import APIError
-from .routers import catalog, payments, plays, statements
+from .routers import catalog, payments, plays, receipts, statements
 
 
 @asynccontextmanager
@@ -18,11 +18,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="演出录音播放版税结算服务",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "登记作品与分成协议、导入播放记录（支持幂等与更正链）、"
         "按播放发生时间匹配协议并逐笔按比例分摊，按期间出具应付/追补单据，"
-        "并按权利人核对此前已出具单据与实际付款（正余额付款、流水号幂等、负额抵扣）。"
+        "并按权利人核对此前已出具单据与实际付款（正余额付款、流水号幂等、负额抵扣）；"
+        "另支持财务按批次导入银行回单：批内校验与整批拒绝、跨批次重复回单标记、"
+        "按外部流水号对照已登记付款逐行冻结核验结论，付款迟到后可复核生成新版本，"
+        "旧版与原始回单始终可查，核验不改写付款、余额或单据。"
     ),
     lifespan=lifespan,
 )
@@ -31,6 +34,7 @@ app.include_router(catalog.router)
 app.include_router(plays.router)
 app.include_router(statements.router)
 app.include_router(payments.router)
+app.include_router(receipts.router)
 
 
 @app.get("/health", tags=["system"])

@@ -226,6 +226,100 @@ WHERE evidence_status = 'traceable'
       WHERE l.batch_id = b.id AND l.amount <> 0
   )
   AND NOT EXISTS (SELECT 1 FROM statement_attributions a WHERE a.batch_id = b.id);
+
+-- ===== 银行回单批量导入与核验（本轮新增） =====
+-- 回单批次：财务按批次导入；同内容重试凭 content_hash 判定幂等，返回原批次。
+CREATE TABLE IF NOT EXISTS receipt_batches (
+    batch_no     text PRIMARY KEY,                 -- 批次编号（调用方提供，全局唯一）
+    line_count   int NOT NULL CHECK (line_count >= 1),
+    content_hash text NOT NULL,                    -- 规范化后的整批内容指纹
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- 回单原始行：原始回单始终可查，一经导入不可修改/删除（触发器强制）。
+-- receipt_no 全局唯一：批次号或回单编号异内容复用整批拒绝。
+-- 跨批次同一 external_ref 仅首次成功导入的回单 duplicate=false（参与核验），
+-- 其余回单 duplicate=true（标为重复回单，不参与核验）。
+CREATE TABLE IF NOT EXISTS bank_receipts (
+    id           bigint GENERATED ALWAYS AS IDENTITY,
+    batch_no     text NOT NULL REFERENCES receipt_batches(batch_no),
+    line_no      int NOT NULL CHECK (line_no >= 1),
+    receipt_no   text NOT NULL UNIQUE,             -- 回单编号，全局唯一
+    external_ref text NOT NULL,                    -- 外部付款流水号
+    holder_code  text NOT NULL,                    -- 权利人编号（字符串，不强制 FK）
+    amount       bigint NOT NULL CHECK (amount > 0),  -- 正整数分额（最小货币单位）
+    duplicate    boolean NOT NULL DEFAULT false,
+    duplicate_of_batch_no text REFERENCES receipt_batches(batch_no),
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT bank_receipts_pkey PRIMARY KEY (batch_no, line_no)
+);
+-- 按流水号对照已登记付款 / 判定跨批次首次导入的主查询索引（仅有效回单）
+CREATE INDEX IF NOT EXISTS bank_receipts_ref_valid_idx
+    ON bank_receipts(external_ref) WHERE duplicate = false;
+CREATE INDEX IF NOT EXISTS bank_receipts_ref_idx ON bank_receipts(external_ref);
+
+-- 核验版本：导入时冻结第 1 版；付款迟到后复核，结论有变化才新增版本。
+CREATE TABLE IF NOT EXISTS receipt_verification_versions (
+    id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    batch_no           text NOT NULL REFERENCES receipt_batches(batch_no),
+    version_no         int NOT NULL CHECK (version_no >= 1),
+    created_by         text NOT NULL CHECK (created_by IN ('import', 'review')),
+    changed_lines_count int NOT NULL DEFAULT 0,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT receipt_versions_uniq UNIQUE (batch_no, version_no)
+);
+
+-- 每版逐行结论（冻结快照）：状态、不符项、对照到的付款付款人/金额一并固化，
+-- 旧版结论不随日后付款新增而改写；核验只读 payments，绝不改写付款、余额或单据。
+CREATE TABLE IF NOT EXISTS receipt_verification_lines (
+    version_id          bigint NOT NULL
+        REFERENCES receipt_verification_versions(id) ON DELETE CASCADE,
+    line_no             int NOT NULL,
+    receipt_no          text NOT NULL,
+    external_ref        text NOT NULL,
+    holder_code         text NOT NULL,
+    receipt_amount      bigint NOT NULL,
+    status              text NOT NULL CHECK (status IN (
+                            'matched', 'payment_unregistered',
+                            'holder_mismatch', 'amount_mismatch',
+                            'both_mismatch', 'duplicate_receipt')),
+    mismatches          text[] NOT NULL DEFAULT '{}',
+    duplicate           boolean NOT NULL DEFAULT false,
+    duplicate_of_batch_no text,
+    payment_id          bigint REFERENCES payments(id),
+    payment_holder_code text,
+    payment_amount      bigint,
+    PRIMARY KEY (version_id, line_no)
+);
+CREATE INDEX IF NOT EXISTS receipt_version_lines_status_idx
+    ON receipt_verification_lines(version_id, status);
+
+-- 回单相关数据全部不可变：批次、原始回单、核验版本与逐行结论一律禁止改/删。
+CREATE OR REPLACE FUNCTION bank_receipts_frozen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'bank receipts and their verification versions are frozen '
+                  || 'and must not be ' || TG_OP || 'd';
+END;
+$$;
+DROP TRIGGER IF EXISTS receipt_batches_frozen_trg ON receipt_batches;
+CREATE TRIGGER receipt_batches_frozen_trg
+    BEFORE UPDATE OR DELETE ON receipt_batches
+    FOR EACH ROW EXECUTE FUNCTION bank_receipts_frozen();
+DROP TRIGGER IF EXISTS bank_receipts_frozen_trg ON bank_receipts;
+CREATE TRIGGER bank_receipts_frozen_trg
+    BEFORE UPDATE OR DELETE ON bank_receipts
+    FOR EACH ROW EXECUTE FUNCTION bank_receipts_frozen();
+DROP TRIGGER IF EXISTS receipt_versions_frozen_trg ON receipt_verification_versions;
+CREATE TRIGGER receipt_versions_frozen_trg
+    BEFORE UPDATE OR DELETE ON receipt_verification_versions
+    FOR EACH ROW EXECUTE FUNCTION bank_receipts_frozen();
+DROP TRIGGER IF EXISTS receipt_version_lines_frozen_trg ON receipt_verification_lines;
+CREATE TRIGGER receipt_version_lines_frozen_trg
+    BEFORE UPDATE OR DELETE ON receipt_verification_lines
+    FOR EACH ROW EXECUTE FUNCTION bank_receipts_frozen();
 """
 
 
